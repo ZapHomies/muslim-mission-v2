@@ -56,14 +56,14 @@ interface UserDataContextType {
   isLoading: boolean;
   completeMission: (missionId: string, bonus_xp?: number, overrideXp?: number) => Promise<void>;
   login: (email: string, password: string) => Promise<void>;
-  logout: () => Promise<void>;
+  logout: ( ) => Promise<void>;
   register: (name: string, email: string, password: string) => Promise<void>;
   updateUser: (updatedData: Partial<Pick<User, 'name' | 'avatar_url'>>) => Promise<void>;
   markWelcomeAsSeen: () => Promise<void>;
   redeemReward: (rewardId: string) => Promise<void>;
-  setActiveBorder: (borderId: string | null) => Promise<void>;
+  setActiveBorder: (border_id: string | null) => Promise<void>;
   createPost: (title: string, content: string) => Promise<void>;
-  addComment: (postId: string, content: string) => Promise<void>;
+  addComment: (post_id: string, content: string) => Promise<void>;
 }
 
 export const UserDataContext = createContext<UserDataContextType>({
@@ -127,7 +127,7 @@ export const UserDataProvider = ({ children }: { children: ReactNode }) => {
     const initialMissions = await generateNewUserMissions(1);
     const now = new Date();
 
-    const newUserPayload = {
+    const newUserPayload: User = {
       id: userId,
       name,
       email,
@@ -147,7 +147,18 @@ export const UserDataProvider = ({ children }: { children: ReactNode }) => {
       active_border_id: 'border-welcome',
     };
 
-    return supabase.from('users').insert(newUserPayload).select().single();
+    const { data, error } = await supabase.from('users').insert(newUserPayload).select().single();
+
+    if (error) {
+        console.error("Error creating new user profile:", error);
+        toast({
+            title: 'Gagal Membuat Profil',
+            description: `Profil Anda tidak dapat dibuat di database. Error: ${error.message}`,
+            variant: 'destructive',
+            duration: 10000
+        });
+    }
+    return { data, error };
   };
 
   // --- DATA FETCHING & SYNC ---
@@ -167,7 +178,6 @@ export const UserDataProvider = ({ children }: { children: ReactNode }) => {
   }, []);
 
   const fetchForumData = useCallback(async () => {
-    // Step 1: Fetch all posts
     const { data: postsData, error: postsError } = await supabase
       .from('posts')
       .select('*')
@@ -183,22 +193,14 @@ export const UserDataProvider = ({ children }: { children: ReactNode }) => {
       return;
     }
 
-    // Step 2: Fetch all comments
     const { data: commentsData, error: commentsError } = await supabase
       .from('comments')
-      .select('*')
-      .order('timestamp', { ascending: true });
+      .select('*');
     
     if (commentsError) {
       console.error('Error fetching comments:', commentsError);
-      toast({ 
-        title: 'Gagal Memuat Komentar Forum', 
-        variant: 'destructive', 
-        description: `Error: ${commentsError.message}` 
-      });
     }
 
-    // Step 3: Combine posts and comments on the client
     const postsWithComments: ForumPost[] = (postsData || []).map(post => ({
       ...post,
       comments: (commentsData || []).filter(comment => comment.post_id === post.id) as ForumComment[],
@@ -263,9 +265,8 @@ export const UserDataProvider = ({ children }: { children: ReactNode }) => {
         .eq('id', session.user.id)
         .single();
       
-      // Self-healing logic for users who exist in auth but not in public.users
       if (!userProfile && (event === 'SIGNED_IN' || event === 'INITIAL_SESSION')) {
-          console.log("User profile not found, attempting to create one (self-healing).");
+          console.log("User profile not found, attempting to self-heal.");
           const userName = session.user.user_metadata?.name || session.user.email?.split('@')[0] || 'Pengguna Baru';
           
           const { data: newUser, error: creationError } = await createNewUserProfile(session.user.id, userName, session.user.email!);
@@ -292,42 +293,53 @@ export const UserDataProvider = ({ children }: { children: ReactNode }) => {
       }
       
       const appUser: User = {
-          ...(userProfile as User),
+          ...userProfile,
           missions: userProfile.missions || [],
           completed_missions: userProfile.completed_missions || [],
           unlocked_reward_ids: userProfile.unlocked_reward_ids || [],
       };
-
-      const { updatedUser, needsDbUpdate } = await processUserSession(appUser);
       
-      if (needsDbUpdate) {
-        const { data: finalUser, error: updateError } = await supabase
-            .from('users')
-            .update({
-              missions: updatedUser.missions,
-              last_daily_reset: updatedUser.last_daily_reset,
-              last_weekly_reset: updatedUser.last_weekly_reset,
-              last_monthly_reset: updatedUser.last_monthly_reset,
-              completed_missions: updatedUser.completed_missions
-            })
-            .eq('id', updatedUser.id)
-            .select()
-            .single();
-        
-        if (updateError) {
-            console.error("Error saving session updates to DB:", updateError);
-            setCurrentUser(updatedUser);
-        } else {
-            setCurrentUser(finalUser as User);
-        }
-      } else {
-        setCurrentUser(updatedUser);
-      }
-      
-      await fetchAllUsers();
-      await fetchForumData();
-      
+      // OPTIMIZATION: Set initial user and stop loading immediately
+      setCurrentUser(appUser);
       setIsLoading(false);
+
+      // --- Defer heavy lifting to background ---
+      const syncAndFetchAdditionalData = async (userToProcess: User) => {
+        // Fetch leaderboard and forum data in parallel
+        await Promise.all([fetchAllUsers(), fetchForumData()]);
+        
+        // Process session for mission resets (slow AI part)
+        const { updatedUser, needsDbUpdate } = await processUserSession(userToProcess);
+
+        if (needsDbUpdate) {
+            const { data: finalUser, error: updateError } = await supabase
+                .from('users')
+                .update({
+                    missions: updatedUser.missions,
+                    last_daily_reset: updatedUser.last_daily_reset,
+                    last_weekly_reset: updatedUser.last_weekly_reset,
+                    last_monthly_reset: updatedUser.last_monthly_reset,
+                    completed_missions: updatedUser.completed_missions
+                })
+                .eq('id', updatedUser.id)
+                .select()
+                .single();
+
+            if (updateError) {
+                console.error("Error saving session updates to DB:", updateError);
+                setCurrentUser(updatedUser); // Still update UI with generated missions
+            } else {
+                setCurrentUser(finalUser as User); // Update with final data from DB
+            }
+        } else {
+             // If no missions were updated, ensure the state is still correct.
+             setCurrentUser(updatedUser);
+        }
+      };
+
+      // Run the sync in the background
+      syncAndFetchAdditionalData(appUser);
+
     });
 
     return () => subscription.unsubscribe();
@@ -351,7 +363,7 @@ export const UserDataProvider = ({ children }: { children: ReactNode }) => {
         password,
         options: {
           data: {
-            name: name, // Store the name in metadata for self-healing
+            name: name,
           },
         },
       });
@@ -378,7 +390,7 @@ export const UserDataProvider = ({ children }: { children: ReactNode }) => {
           console.error("Gagal membuat profil lengkap:", creationError);
           toast({
             title: 'Gagal Menyimpan Profil',
-            description: `Akun Anda berhasil dibuat, tetapi gagal menyimpan detail profil. Saat Anda login, sistem akan mencoba memperbaikinya. Error: ${creationError.message}.`,
+            description: `Akun Anda berhasil dibuat, tetapi gagal menyimpan detail profil. Saat Anda login, sistem akan mencoba memperbaikinya.`,
             variant: 'destructive',
             duration: 15000,
           });
@@ -418,8 +430,10 @@ export const UserDataProvider = ({ children }: { children: ReactNode }) => {
         description: "Gagal keluar dari sesi. Silakan coba lagi.",
         variant: "destructive"
       });
+    } else {
+      setCurrentUser(null);
+      router.push('/');
     }
-    // The onAuthStateChange listener will handle state clearing and redirection.
   };
 
   const completeMission = async (missionId: string, bonus_xp = 0, overrideXp?: number) => {
@@ -521,7 +535,6 @@ export const UserDataProvider = ({ children }: { children: ReactNode }) => {
             description: `Terjadi kesalahan: ${error.message}.`
         });
         console.error("Error updating profile:", error.message, error);
-        // Revert optimistic update
         setCurrentUser(originalUser);
         setAllUsers(prevUsers => prevUsers.map(u => u.id === originalUser.id ? originalUser : u));
     } else {
@@ -569,12 +582,12 @@ export const UserDataProvider = ({ children }: { children: ReactNode }) => {
       }
   };
 
-  const setActiveBorder = async (borderId: string | null) => {
+  const setActiveBorder = async (border_id: string | null) => {
     if (!currentUser) return;
     const originalUser = { ...currentUser };
-    const updatedUser = { ...currentUser, active_border_id: borderId };
+    const updatedUser = { ...currentUser, active_border_id: border_id };
     setCurrentUser(updatedUser);
-    const { error } = await supabase.from('users').update({ active_border_id: borderId }).eq('id', currentUser.id);
+    const { error } = await supabase.from('users').update({ active_border_id: border_id }).eq('id', currentUser.id);
      if (error) {
         console.error("Error setting active border:", error.message, error);
         toast({ title: 'Gagal Mengatur Bingkai', description: `Terjadi kesalahan: ${error.message}`, variant: 'destructive' });
@@ -594,34 +607,32 @@ export const UserDataProvider = ({ children }: { children: ReactNode }) => {
     const { error } = await supabase.from('posts').insert(newPostData);
 
     if (error) {
-        console.error("Error creating post:", error.message, error);
-        toast({ title: 'Gagal Membuat Postingan', variant: 'destructive', description: `Terjadi kesalahan: ${error.message}.` });
+        console.error("Error creating post:", error);
+        toast({ title: 'Gagal Membuat Postingan', variant: 'destructive', description: `Gagal menyimpan postingan ke database: ${error.message}` });
         return;
     }
     
-    // Refetch forum data to show the new post
     await fetchForumData();
     toast({ title: 'Postingan Dibuat!', variant: 'success' });
   };
   
-  const addComment = async (postId: string, content: string) => {
+  const addComment = async (post_id: string, content: string) => {
     if (!currentUser) return;
 
     const newCommentData = {
         author_id: currentUser.id,
-        post_id: postId,
+        post_id: post_id,
         content,
     };
 
     const { error } = await supabase.from('comments').insert(newCommentData);
 
     if (error) {
-        console.error("Error adding comment:", error.message, error);
-        toast({ title: 'Gagal Menambah Komentar', variant: 'destructive', description: `Terjadi kesalahan: ${error.message}.`});
+        console.error("Error adding comment:", error);
+        toast({ title: 'Gagal Menambah Komentar', variant: 'destructive', description: `Gagal menyimpan komentar ke database: ${error.message}`});
         return;
     }
 
-    // Refetch forum data to show the new comment
     await fetchForumData();
   };
   
